@@ -5,3 +5,9 @@ incoming_fit
 .idea/
 .vscode/
 *.iml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
