@@ -134,3 +134,36 @@ jq -r '[.session_start_time, .sport, (.total_distance_km | tostring) + " km"] | 
 ```
 
 Les fichiers `.fit` bruts dans `incoming_fit/` sont conservés intacts pour un éventuel retraitement ou import dans d'autres outils (Strava, TrainingPeaks, etc.).
+
+## Tests
+
+Les tests unitaires couvrent les cas limites de fiabilité et de sécurité : déduplication des imports, sauvegarde incrémentale du state (résistance aux interruptions), validation des chemins de configuration, sérialisation des types FIT, et gestion des erreurs de montage.
+
+**Prérequis :** le venv doit exister et contenir `pytest`. S'il n'a pas encore été créé, lancer le script une première fois (voir [Utilisation](#utilisation)) ou l'initialiser manuellement :
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+**Lancer tous les tests :**
+
+```bash
+.venv/bin/pytest tests/ -v
+```
+
+**Lancer un groupe de tests spécifique :**
+
+```bash
+# Uniquement les tests sur safe_value
+.venv/bin/pytest tests/ -v -k "TestSafeValue"
+
+# Uniquement les tests de sécurité sur la configuration
+.venv/bin/pytest tests/ -v -k "TestGetBaseDirSecurity"
+```
+
+**Lancer un test unique :**
+
+```bash
+.venv/bin/pytest tests/test_pipeline.py::TestCopyNewFilesIncrementalState::test_state_preserved_after_interruption -v
+```

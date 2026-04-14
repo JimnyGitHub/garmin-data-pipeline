@@ -3,6 +3,9 @@
 Bootstrap : s'assure que le script tourne dans le venv du projet.
 Si ce n'est pas le cas, crée le venv, installe les dépendances, puis se
 ré-exécute automatiquement avec le bon interpréteur.
+
+Mettre la variable d'environnement GARMIN_SKIP_BOOTSTRAP=1 pour désactiver
+le bootstrap (utilisé par les tests unitaires).
 """
 import sys
 import os
@@ -13,12 +16,28 @@ VENV_DIR = SCRIPT_DIR / ".venv"
 REQUIREMENTS = SCRIPT_DIR / "requirements.txt"
 
 
+def _check_requirements() -> None:
+    """Vérifie que requirements.txt existe avant de tenter l'installation."""
+    if not REQUIREMENTS.exists():
+        print(
+            f"Erreur : fichier de dépendances introuvable : {REQUIREMENTS}\n"
+            "Créez un fichier requirements.txt à la racine du projet.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _bootstrap_venv() -> None:
-    venv_python = VENV_DIR / "bin" / "python"
+    if os.environ.get("GARMIN_SKIP_BOOTSTRAP"):
+        return  # désactivé pour les tests
+
     if Path(sys.prefix) == VENV_DIR:
         return  # déjà dans le bon venv
 
+    venv_python = VENV_DIR / "bin" / "python"
+
     if not venv_python.exists():
+        _check_requirements()
         print("Création du venv...")
         import subprocess
         subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
@@ -35,6 +54,7 @@ def _bootstrap_venv() -> None:
 _bootstrap_venv()
 
 # À partir d'ici on est forcément dans le venv avec fitdecode disponible.
+import enum
 import json
 import shutil
 import subprocess
@@ -69,9 +89,22 @@ def save_config(config: dict[str, Any]) -> None:
 
 
 def get_base_dir() -> Path:
+    """Lit base_dir depuis config.json et valide qu'il est dans le home."""
     config = load_config()
     raw = config.get("base_dir")
-    return Path(raw).expanduser() if raw else DEFAULT_BASE_DIR
+    if not raw:
+        return DEFAULT_BASE_DIR
+
+    path = Path(raw).expanduser().resolve()
+    home = Path.home().resolve()
+    try:
+        path.relative_to(home)
+    except ValueError:
+        raise ValueError(
+            f"base_dir doit être dans le répertoire personnel ({home}), "
+            f"valeur reçue : {path}"
+        )
+    return path
 
 
 def ensure_base_dir(base_dir: Path) -> None:
@@ -133,7 +166,12 @@ def save_state(state_file: Path, state: dict[str, Any]) -> None:
 
 
 def mount_watch() -> None:
-    if not any(MOUNT_DIR.iterdir()):
+    try:
+        already_mounted = any(MOUNT_DIR.iterdir())
+    except OSError:
+        # Répertoire inaccessible ou point de montage cassé : on tente le montage
+        already_mounted = False
+    if not already_mounted:
         run(["jmtpfs", str(MOUNT_DIR)])
 
 
@@ -165,11 +203,14 @@ def copy_new_files(incoming_dir: Path, state_file: Path) -> list[Path]:
             dest_file = incoming_dir / f"{stem}_{i}{suffix}"
 
         shutil.copy2(fit_file, dest_file)
+
+        # Sauvegarde incrémentale : chaque fichier copié est immédiatement
+        # enregistré dans le state pour éviter les doublons en cas d'interruption.
         imported.add(key)
         copied.append(dest_file)
+        state["imported"] = sorted(imported)
+        save_state(state_file, state)
 
-    state["imported"] = sorted(imported)
-    save_state(state_file, state)
     return copied
 
 
@@ -178,9 +219,19 @@ def copy_new_files(incoming_dir: Path, state_file: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 def safe_value(value: Any) -> Any:
+    """Convertit une valeur fitdecode en type JSON-sérialisable."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
     if isinstance(value, datetime):
         return value.isoformat()
-    return value
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, enum.Enum):
+        return value.name
+    if isinstance(value, (list, tuple)):
+        return [safe_value(v) for v in value]
+    # Fallback pour tout type inconnu (ex : objets internes fitdecode)
+    return str(value)
 
 
 def fit_record_to_dict(frame: fitdecode.records.FitDataMessage) -> dict[str, Any]:
