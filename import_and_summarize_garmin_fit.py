@@ -58,6 +58,7 @@ import enum
 import json
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from typing import Any
 
@@ -72,7 +73,8 @@ CONFIG_FILE = SCRIPT_DIR / "config.json"
 DEFAULT_BASE_DIR = Path.home() / "Documents" / "sports" / "donneesGarmin"
 
 MOUNT_DIR = Path.home() / "garmin-mtp"
-SOURCE_DIR = MOUNT_DIR / "Internal Storage" / "GARMIN" / "Activity"
+_GARMIN_ACTIVITY_RELPATH = Path("Internal Storage") / "GARMIN" / "Activity"
+SOURCE_DIR = MOUNT_DIR / _GARMIN_ACTIVITY_RELPATH  # conservé pour compatibilité
 
 
 def load_config() -> dict[str, Any]:
@@ -165,29 +167,121 @@ def save_state(state_file: Path, state: dict[str, Any]) -> None:
     state_file.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def mount_watch() -> None:
+def _find_gvfs_mtp_entries() -> list[Path]:
+    """Retourne tous les points de montage MTP gérés par GVFS."""
+    gvfs_dir = Path("/run/user") / str(os.getuid()) / "gvfs"
+    if not gvfs_dir.exists():
+        return []
+    try:
+        return [e for e in gvfs_dir.iterdir() if e.name.startswith("mtp:")]
+    except OSError:
+        return []
+
+
+def _release_gvfs(gvfs_path: Path) -> None:
+    """Demande à GVFS de relâcher le périphérique MTP."""
+    for cmd in [
+        ["gio", "mount", "-u", str(gvfs_path)],
+        ["gvfs-mount", "-u", str(gvfs_path)],
+    ]:
+        result = subprocess.run(cmd, text=True, capture_output=True)
+        if result.returncode == 0:
+            break
+    time.sleep(2)
+
+
+def _jmtpfs_error_message(stderr: str) -> str:
+    """Traduit le stderr de jmtpfs en message utilisateur actionnable."""
+    if "device is busy" in stderr or "libusb_claim_interface" in stderr:
+        return (
+            "La montre est retenue par le gestionnaire de fichiers système (GVFS/Nautilus).\n"
+            "Solutions :\n"
+            "  1. Fermez le gestionnaire de fichiers et réessayez.\n"
+            "  2. Ou libérez le périphérique manuellement :\n"
+            "       gio mount -u /run/user/$(id -u)/gvfs/<mtp:...>\n"
+            "  3. Ou débranchez/rebranchez la montre après avoir fermé le gestionnaire de fichiers."
+        )
+    if "No MTP devices found" in stderr or "no mtp devices" in stderr.lower():
+        return (
+            "Aucune montre Garmin détectée.\n"
+            "Vérifiez que :\n"
+            "  - Le câble USB est bien branché\n"
+            "  - La montre est allumée\n"
+            "  - La montre est en mode 'Transfert de fichiers' (MTP)"
+        )
+    return f"Détail de l'erreur :\n{stderr.strip()}"
+
+
+def mount_watch() -> tuple[Path, bool]:
+    """Monte la montre et retourne (source_dir, monté_par_script).
+
+    Si monté_par_script est False, l'appelant ne doit pas démonter.
+    """
+    # 1. Déjà monté par jmtpfs ?
     try:
         already_mounted = any(MOUNT_DIR.iterdir())
     except OSError:
-        # Répertoire inaccessible ou point de montage cassé : on tente le montage
         already_mounted = False
-    if not already_mounted:
-        run(["jmtpfs", str(MOUNT_DIR)])
+    if already_mounted:
+        source_dir = MOUNT_DIR / _GARMIN_ACTIVITY_RELPATH
+        if source_dir.exists():
+            print("  Montre déjà montée.")
+            return source_dir, False
+        # Montage périmé ou incomplet — nettoyage avant nouvelle tentative
+        subprocess.run(["fusermount", "-u", str(MOUNT_DIR)], text=True, capture_output=True)
+
+    # 2. Déjà monté par GVFS avec le dossier activités accessible ?
+    for gvfs_entry in _find_gvfs_mtp_entries():
+        source_dir = gvfs_entry / _GARMIN_ACTIVITY_RELPATH
+        if source_dir.exists():
+            print(f"  Montre détectée via le gestionnaire de fichiers (GVFS) : {gvfs_entry.name}")
+            return source_dir, False
+
+    # 3. Tentative de montage direct via jmtpfs
+    result = subprocess.run(["jmtpfs", str(MOUNT_DIR)], text=True, capture_output=True)
+    if result.returncode == 0:
+        return MOUNT_DIR / _GARMIN_ACTIVITY_RELPATH, True
+
+    # 4. Échec jmtpfs — traitement des causes connues
+    stderr = result.stderr
+    if "device is busy" in stderr or "libusb_claim_interface" in stderr:
+        gvfs_entries = _find_gvfs_mtp_entries()
+        if gvfs_entries:
+            gvfs_entry = gvfs_entries[0]
+            print(f"  Conflit GVFS détecté ({gvfs_entry.name}). Libération et nouvelle tentative...")
+            _release_gvfs(gvfs_entry)
+            result2 = subprocess.run(["jmtpfs", str(MOUNT_DIR)], text=True, capture_output=True)
+            if result2.returncode == 0:
+                return MOUNT_DIR / _GARMIN_ACTIVITY_RELPATH, True
+            raise RuntimeError(
+                "Impossible de monter la montre même après libération de GVFS.\n"
+                + _jmtpfs_error_message(result2.stderr)
+            )
+
+    raise RuntimeError(
+        "Impossible de monter la montre Garmin.\n"
+        + _jmtpfs_error_message(stderr)
+    )
 
 
-def unmount_watch() -> None:
+def unmount_watch(mounted_by_script: bool) -> None:
+    if not mounted_by_script:
+        return
     subprocess.run(["fusermount", "-u", str(MOUNT_DIR)], text=True, capture_output=True)
 
 
-def copy_new_files(incoming_dir: Path, state_file: Path) -> list[Path]:
+def copy_new_files(source_dir: Path, incoming_dir: Path, state_file: Path) -> list[Path]:
     state = load_state(state_file)
     imported = set(state.get("imported", []))
     copied: list[Path] = []
 
-    if not SOURCE_DIR.exists():
-        raise RuntimeError(f"Dossier source introuvable: {SOURCE_DIR}")
+    if not source_dir.exists():
+        raise RuntimeError(
+            f"Dossier source introuvable : {source_dir}\n"
+            "Vérifiez que la montre est correctement montée et que le chemin est accessible."
+        )
 
-    fit_files = sorted(SOURCE_DIR.glob("*.fit")) + sorted(SOURCE_DIR.glob("*.FIT"))
+    fit_files = sorted(source_dir.glob("*.fit")) + sorted(source_dir.glob("*.FIT"))
 
     for fit_file in fit_files:
         key = f"{fit_file.name}|{fit_file.stat().st_size}"
@@ -388,12 +482,13 @@ def main() -> None:
 
     incoming_dir, summary_dir, state_file = ensure_dirs(base_dir)
 
+    mounted_by_script = False
     try:
-        print("Montage de la montre...")
-        mount_watch()
+        print("Connexion à la montre...")
+        source_dir, mounted_by_script = mount_watch()
 
-        print(f"Lecture de : {SOURCE_DIR}")
-        copied = copy_new_files(incoming_dir, state_file)
+        print(f"Lecture de : {source_dir}")
+        copied = copy_new_files(source_dir, incoming_dir, state_file)
 
         if not copied:
             print("Aucun nouveau fichier .fit à copier.")
@@ -413,8 +508,9 @@ def main() -> None:
                 print(f"  Erreur sur {fit_file.name}: {exc}")
 
     finally:
-        print("Démontage...")
-        unmount_watch()
+        if mounted_by_script:
+            print("Démontage...")
+        unmount_watch(mounted_by_script)
 
 
 if __name__ == "__main__":
